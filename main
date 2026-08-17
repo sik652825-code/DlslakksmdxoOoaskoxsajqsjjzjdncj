@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""
+🤖 TELEGRAM БОТ ДЛЯ РАССЫЛОК
+@avtorasslkabot
+Версия: 4.0.0
+"""
+
+import asyncio
+import sqlite3
+import os
+import sys
+import json
+import random
+import string
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+
+# ============================================================================
+# УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ============================================================================
+def install_pkg(pkg):
+    try:
+        __import__(pkg)
+        return True
+    except ImportError:
+        import subprocess
+        print(f"📦 Установка {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        return True
+
+for pkg in ['telethon', 'loguru', 'pillow']:
+    install_pkg(pkg)
+
+# ============================================================================
+# ИМПОРТЫ
+# ============================================================================
+from telethon import TelegramClient, Button, events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError
+from loguru import logger
+from PIL import Image
+import io
+
+# ============================================================================
+# КОНФИГ
+# ============================================================================
+API_ID = 28121815
+API_HASH = "05ad718bad150a8e636724e9fed59503"
+BOT_TOKEN = "8982691390:AAFlUfA0rL-iXfnV2-jqfYQz0CaY6eEsPK8"
+BOT_NAME = "avtorasslkabot"
+ADMINS = [8365786708, 6668784806]
+
+CARD = "2202 2081 8598 3716"
+CARD_HOLDER = "MAGISTR BOT"
+
+PRICE_PER_DAY = 15
+TRIAL_DAYS = 3
+VERSION = "4.0.0"
+
+DB = "bot.db"
+
+# ============================================================================
+# БАЗА ДАННЫХ
+# ============================================================================
+def db_init():
+    conn = sqlite3.connect(DB)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            name TEXT,
+            reg TEXT,
+            sub_end TEXT,
+            sub_type TEXT DEFAULT 'Нет',
+            has_sub INTEGER DEFAULT 0,
+            paid INTEGER DEFAULT 0,
+            trial INTEGER DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            ref TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            session TEXT,
+            created TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_id INTEGER,
+            title TEXT,
+            username TEXT,
+            added TEXT,
+            sent INTEGER DEFAULT 0
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_title TEXT,
+            sent_at TEXT,
+            text TEXT,
+            status TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            days INTEGER,
+            amount INTEGER,
+            status TEXT DEFAULT 'pending',
+            created TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("✅ База данных готова")
+
+def db_query(query, params=(), fetchone=False, fetchall=False):
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(query, params)
+    if fetchone:
+        result = cur.fetchone()
+    elif fetchall:
+        result = cur.fetchall()
+    else:
+        result = None
+    conn.commit()
+    conn.close()
+    return result
+
+# ============================================================================
+# ФУНКЦИИ
+# ============================================================================
+def get_user(user_id):
+    row = db_query('SELECT * FROM users WHERE id = ?', (user_id,), fetchone=True)
+    return dict(row) if row else None
+
+def reg_user(user_id, username, name):
+    if get_user(user_id):
+        return False
+    ref = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    db_query(
+        'INSERT INTO users (id, username, name, reg, ref) VALUES (?, ?, ?, ?, ?)',
+        (user_id, username or '', name or '', datetime.now().isoformat(), ref)
+    )
+    return True
+
+def has_sub(user_id):
+    row = db_query('SELECT sub_end, has_sub, banned FROM users WHERE id = ?', (user_id,), fetchone=True)
+    if not row or row[2]:
+        return False
+    if row[1] and row[0]:
+        try:
+            return datetime.now() < datetime.fromisoformat(row[0])
+        except:
+            pass
+    return False
+
+def get_sub(user_id):
+    row = db_query('SELECT sub_type, sub_end FROM users WHERE id = ?', (user_id,), fetchone=True)
+    if not row:
+        return "Нет", 0
+    days = 0
+    if row[1]:
+        try:
+            days = max(0, (datetime.fromisoformat(row[1]) - datetime.now()).days)
+        except:
+            pass
+    return row[0] or "Нет", days
+
+def trial(user_id):
+    row = db_query('SELECT trial, sub_end FROM users WHERE id = ?', (user_id,), fetchone=True)
+    if not row or row[0]:
+        return False
+    if row[1]:
+        try:
+            if datetime.now() < datetime.fromisoformat(row[1]):
+                return False
+        except:
+            pass
+    end = (datetime.now() + timedelta(days=TRIAL_DAYS)).isoformat()
+    db_query(
+        'UPDATE users SET sub_end = ?, sub_type = ?, has_sub = 1, trial = 1 WHERE id = ?',
+        (end, "Пробная", user_id)
+    )
+    return True
+
+def extend_sub(user_id, days, amount):
+    row = db_query('SELECT sub_end FROM users WHERE id = ?', (user_id,), fetchone=True)
+    if row and row[0]:
+        try:
+            current = datetime.fromisoformat(row[0])
+            end = current + timedelta(days=days) if datetime.now() < current else datetime.now() + timedelta(days=days)
+        except:
+            end = datetime.now() + timedelta(days=days)
+    else:
+        end = datetime.now() + timedelta(days=days)
+    
+    if days >= 9999:
+        st = "НАВСЕГДА"
+    elif days >= 365:
+        st = "VIP"
+    elif days >= 90:
+        st = "PREMIUM"
+    else:
+        st = "Базовая"
+    
+    db_query(
+        'UPDATE users SET sub_end = ?, sub_type = ?, has_sub = 1, paid = paid + ? WHERE id = ?',
+        (end.isoformat(), st, amount, user_id)
+    )
+
+def save_session(user_id, session):
+    db_query('INSERT OR REPLACE INTO sessions (id, session, created) VALUES (?, ?, ?)',
+             (user_id, session, datetime.now().isoformat()))
+
+def get_session(user_id):
+    row = db_query('SELECT session FROM sessions WHERE id = ?', (user_id,), fetchone=True)
+    return row[0] if row else None
+
+def add_group(user_id, group_id, title, username=''):
+    db_query('INSERT OR IGNORE INTO groups (user_id, group_id, title, username, added) VALUES (?, ?, ?, ?, ?)',
+             (user_id, group_id, title[:50], username, datetime.now().isoformat()))
+
+def add_groups(user_id, groups):
+    count = 0
+    for g in groups:
+        try:
+            db_query(
+                'INSERT OR IGNORE INTO groups (user_id, group_id, title, username, added) VALUES (?, ?, ?, ?, ?)',
+                (user_id, g['id'], g['title'][:50], g.get('username', ''), datetime.now().isoformat())
+            )
+            count += 1
+        except:
+            pass
+    return count
+
+def get_groups(user_id):
+    rows = db_query('SELECT group_id, title, username, sent FROM groups WHERE user_id = ? ORDER BY title',
+                    (user_id,), fetchall=True)
+    return [{'id': r[0], 'title': r[1], 'username': r[2] or '', 'sent': r[3]} for r in rows]
+
+def clear_groups(user_id):
+    db_query('DELETE FROM groups WHERE user_id = ?', (user_id,))
+
+def save_payment(user_id, days, amount):
+    cur = db_query('INSERT INTO payments (user_id, days, amount, created) VALUES (?, ?, ?, ?)',
+                   (user_id, days, amount, datetime.now().isoformat()))
+    return cur.lastrowid if hasattr(cur, 'lastrowid') else 0
+
+def get_stats():
+    users = db_query('SELECT COUNT(*) FROM users', fetchone=True)[0]
+    active = db_query('SELECT COUNT(*) FROM users WHERE has_sub = 1 AND banned = 0', fetchone=True)[0]
+    revenue = db_query('SELECT SUM(paid) FROM users', fetchone=True)[0] or 0
+    groups = db_query('SELECT COUNT(*) FROM groups', fetchone=True)[0]
+    pending = db_query('SELECT COUNT(*) FROM payments WHERE status = "pending"', fetchone=True)[0]
+    return {'users': users, 'active': active, 'revenue': revenue, 'groups': groups, 'pending': pending}
+
+def get_users():
+    rows = db_query('SELECT id, username, name, sub_type, has_sub, banned FROM users', fetchall=True)
+    return [dict(r) for r in rows]
+
+def get_pending():
+    rows = db_query('SELECT id, user_id, days, amount, created FROM payments WHERE status = "pending" ORDER BY created',
+                    fetchall=True)
+    return [dict(r) for r in rows]
+
+def confirm_pay(payment_id):
+    row = db_query('SELECT user_id, days, amount FROM payments WHERE id = ? AND status = "pending"',
+                   (payment_id,), fetchone=True)
+    if not row:
+        return False
+    extend_sub(row[0], row[1], row[2])
+    db_query('UPDATE payments SET status = "confirmed" WHERE id = ?', (payment_id,))
+    return True
+
+# ============================================================================
+# БОТ
+# ============================================================================
+bot = TelegramClient("bot_session", API_ID, API_HASH)
+
+states = {}
+selected = {}
+pending = {}
+clients = {}
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ
+# ============================================================================
+def fmt(n):
+    return f"{n:,}".replace(",", " ") if n else "0"
+
+def trunc(t, n=100):
+    return t[:n-3] + "..." if len(t) > n else t
+
+def sig(t):
+    s = f"\n\n📢 @{BOT_NAME} | v{VERSION}"
+    return t[:4096-len(s)-10] + s if len(t) + len(s) > 4096 else t + s
+
+# ============================================================================
+# КЛИЕНТ
+# ============================================================================
+async def get_client(user_id):
+    if user_id in clients:
+        c = clients[user_id]
+        if c.is_connected():
+            return c
+    session = get_session(user_id)
+    if not session:
+        return None
+    c = TelegramClient(StringSession(session), API_ID, API_HASH)
+    await c.connect()
+    if await c.is_user_authorized():
+        clients[user_id] = c
+        return c
+    await c.disconnect()
+    return None
+
+# ============================================================================
+# ОТПРАВКА
+# ============================================================================
+async def send_groups(user_id, groups, text, image=None):
+    if not has_sub(user_id):
+        return 0, 0, ["Подписка истекла"]
+    
+    client = await get_client(user_id)
+    if not client:
+        return 0, 0, ["Нет аккаунта"]
+    
+    text = sig(text)
+    ok, fail, failed = 0, 0, []
+    
+    for i, g in enumerate(groups[:200]):
+        try:
+            if i > 0:
+                await asyncio.sleep(2)
+            entity = await client.get_entity(int(g['id']))
+            if image:
+                await client.send_file(entity, image, caption=text)
+            else:
+                await client.send_message(entity, text)
+            ok += 1
+            db_query('UPDATE groups SET sent = sent + 1 WHERE user_id = ? AND group_id = ?',
+                     (user_id, int(g['id'])))
+            db_query('INSERT INTO history (user_id, group_title, sent_at, text, status) VALUES (?, ?, ?, ?, ?)',
+                     (user_id, g['title'][:30], datetime.now().isoformat(), text[:100], 'sent'))
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 5)
+            fail += 1
+            failed.append(g['title'])
+        except Exception as e:
+            fail += 1
+            failed.append(g['title'])
+            logger.error(f"Ошибка в {g['title']}: {e}")
+    
+    return ok, fail, failed
+
+# ============================================================================
+# ИМПОРТ
+# ============================================================================
+async def import_groups(user_id):
+    client = await get_client(user_id)
+    if not client:
+        return []
+    try:
+        dialogs = await client.get_dialogs()
+        groups = []
+        for d in dialogs:
+            if d.is_group or d.is_channel:
+                if d.entity.id > 0:
+                    groups.append({
+                        'id': d.entity.id,
+                        'title': d.name or str(d.entity.id),
+                        'username': getattr(d.entity, 'username', '')
+                    })
+        return groups
+    except Exception as e:
+        logger.error(f"Ошибка импорта: {e}")
+        return []
+
+# ============================================================================
+# МЕНЮ
+# ============================================================================
+def menu(user_id):
+    btns = [
+        [Button.inline("➕ Аккаунт", b"acc"), Button.inline("📋 Импорт", b"import")],
+        [Button.inline("👥 Группы", b"groups"), Button.inline("📨 Рассылка", b"send")],
+        [Button.inline("🛍️ Подписка", b"sub"), Button.inline("ℹ️ Инфо", b"info")]
+    ]
+    if user_id in ADMINS:
+        btns.append([Button.inline("👑 Админ", b"admin")])
+    return btns
+
+# ============================================================================
+# КОМАНДЫ
+# ============================================================================
+@bot.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    uid = event.sender_id
+    user = await event.get_sender()
+    reg_user(uid, user.username, user.first_name)
+    st, days = get_sub(uid)
+    await event.respond(
+        f"👋 @{BOT_NAME}\n📦 {st} | {days} дн.\n\n🚀 Добавь аккаунт → импортируй группы → делай рассылку!",
+        buttons=menu(uid)
+    )
+
+@bot.on(events.NewMessage(pattern="/help"))
+async def help(event):
+    await event.respond(f"🤖 @{BOT_NAME}\n/start - Меню\n/help - Помощь\n\n📱 @sikvvg")
+
+# ============================================================================
+# КНОПКИ
+# ============================================================================
+@bot.on(events.CallbackQuery)
+async def callback(event):
+    uid = event.sender_id
+    data = event.data.decode()
+    
+    # Аккаунт
+    if data == "acc":
+        await event.respond("📱 Введите номер: +7XXXXXXXXXX")
+        states[uid] = "phone"
+        await event.answer()
+        return
+    
+    # Импорт
+    if data == "import":
+        await event.edit("⏳ Загрузка...")
+        groups = await import_groups(uid)
+        if groups:
+            added = add_groups(uid, groups)
+            await event.edit(f"✅ Добавлено {added} групп")
+        else:
+            await event.edit("❌ Нет групп")
+        await asyncio.sleep(1)
+        st, days = get_sub(uid)
+        await event.respond(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        return
+    
+    # Группы
+    if data == "groups":
+        groups = get_groups(uid)
+        if not groups:
+            await event.edit("❌ Нет групп", buttons=[[Button.inline("◀️ Назад", b"back")]])
+            return
+        text = f"👥 ГРУППЫ ({len(groups)})\n\n"
+        for g in groups[:20]:
+            text += f"📌 {g['title'][:25]} - {g['sent']} отправок\n"
+        if len(groups) > 20:
+            text += f"\n... и еще {len(groups)-20}"
+        await event.edit(text, buttons=[[Button.inline("🗑️ Очистить", b"clear")], [Button.inline("◀️ Назад", b"back")]])
+        return
+    
+    if data == "clear":
+        clear_groups(uid)
+        await event.edit("✅ Очищено", buttons=[[Button.inline("◀️ Назад", b"back")]])
+        return
+    
+    # Рассылка
+    if data == "send":
+        groups = get_groups(uid)
+        if not groups:
+            await event.edit("❌ Нет групп", buttons=[[Button.inline("◀️ Назад", b"back")]])
+            return
+        pending[uid] = {'groups': [{'id': g['id'], 'title': g['title']} for g in groups]}
+        await event.respond(
+            f"📨 ВСЕ ГРУППЫ: {len(groups)}\n\nОтправьте текст (можно с фото)",
+            buttons=[[Button.inline("◀️ Назад", b"back")]]
+        )
+        states[uid] = "broadcast"
+        await event.answer()
+        return
+    
+    # Подписка
+    if data == "sub":
+        st, days = get_sub(uid)
+        text = f"🛍️ ПОДПИСКА\n\n📦 {st} | {days} дн.\n\n"
+        text += "💰 Цены:\n🎁 3 дн. - БЕСПЛАТНО\n📦 30 дн. - 450 руб\n⭐ 90 дн. - 599 руб\n💎 365 дн. - 1499 руб\n👑 НАВСЕГДА - 1999 руб\n\n"
+        text += f"💳 {CARD}\n{CARD_HOLDER}"
+        await event.edit(text, buttons=[
+            [Button.inline("🎁 Пробная", b"trial")],
+            [Button.inline("📦 30 дн.", b"buy30")],
+            [Button.inline("⭐ 90 дн.", b"buy90")],
+            [Button.inline("💎 365 дн.", b"buy365")],
+            [Button.inline("👑 НАВСЕГДА", b"buy9999")],
+            [Button.inline("◀️ Назад", b"back")]
+        ])
+        return
+    
+    if data == "trial":
+        if trial(uid):
+            await event.edit("✅ Пробная на 3 дня!")
+        else:
+            await event.edit("❌ Уже использована")
+        await asyncio.sleep(1)
+        st, days = get_sub(uid)
+        await event.respond(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        return
+    
+    if data.startswith("buy"):
+        days = int(data.replace("buy", ""))
+        price = {30: 450, 90: 599, 365: 1499, 9999: 1999}[days]
+        pid = save_payment(uid, days, price)
+        await event.edit(
+            f"💳 ОПЛАТА #{pid}\n\n📅 {days} дн. | 💰 {price} руб\n\n💳 {CARD}\n{CARD_HOLDER}\n💬 Коммент: {pid}\n\n📝 Отправьте скриншот",
+            buttons=[[Button.inline("✅ Оплатил", b"paid")]]
+        )
+        return
+    
+    if data == "paid":
+        await event.respond("📷 Отправьте скриншот")
+        states[uid] = "payment"
+        await event.answer()
+        return
+    
+    # Инфо
+    if data == "info":
+        st, days = get_sub(uid)
+        await event.edit(
+            f"ℹ️ @{BOT_NAME}\n📌 v{VERSION}\n📦 {st} | {days} дн.\n📱 @sikvvg",
+            buttons=[[Button.inline("◀️ Назад", b"back")]]
+        )
+        return
+    
+    # Админ
+    if data == "admin":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        st = get_stats()
+        await event.edit(
+            f"👑 АДМИН\n\n👥 {fmt(st['users'])}\n🟢 {fmt(st['active'])}\n💰 {fmt(st['revenue'])} руб\n👥 {fmt(st['groups'])}\n💳 {fmt(st['pending'])}",
+            buttons=[
+                [Button.inline("📊 Статистика", b"stats")],
+                [Button.inline("👥 Пользователи", b"users")],
+                [Button.inline("💳 Платежи", b"payments")],
+                [Button.inline("📢 Объявление", b"broadcast")],
+                [Button.inline("◀️ Назад", b"back")]
+            ]
+        )
+        return
+    
+    if data == "stats":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        st = get_stats()
+        await event.edit(
+            f"📊 СТАТИСТИКА\n\n👥 {fmt(st['users'])}\n🟢 {fmt(st['active'])}\n💰 {fmt(st['revenue'])} руб\n👥 {fmt(st['groups'])}\n💳 {fmt(st['pending'])}",
+            buttons=[[Button.inline("◀️ Назад", b"admin")]]
+        )
+        return
+    
+    if data == "users":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        users = get_users()
+        text = f"👥 ПОЛЬЗОВАТЕЛИ ({len(users)})\n\n"
+        for u in users[:20]:
+            s = "🟢" if u['has_sub'] else "🔴"
+            if u['banned']:
+                s = "⛔"
+            text += f"{s} {u['id']} | @{u['username'] or 'нет'} | {u['sub_type']}\n"
+        if len(users) > 20:
+            text += f"\n... и еще {len(users)-20}"
+        await event.edit(text, buttons=[[Button.inline("◀️ Назад", b"admin")]])
+        return
+    
+    if data == "payments":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        payments = get_pending()
+        if not payments:
+            await event.edit("💳 Нет платежей", buttons=[[Button.inline("◀️ Назад", b"admin")]])
+            return
+        text = f"💳 ПЛАТЕЖИ ({len(payments)})\n\n"
+        for p in payments[:10]:
+            text += f"#{p['id']} | {p['user_id']} | {p['days']} дн. | {p['amount']} руб\n"
+        await event.edit(text, buttons=[
+            [Button.inline("✅ Подтвердить", b"confirm")],
+            [Button.inline("◀️ Назад", b"admin")]
+        ])
+        return
+    
+    if data == "broadcast":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        await event.respond("📢 Введите сообщение для всех")
+        states[uid] = "admin_broadcast"
+        await event.answer()
+        return
+    
+    if data == "confirm":
+        if uid not in ADMINS:
+            await event.answer("⛔ Нет доступа", alert=True)
+            return
+        await event.respond("🔢 Введите ID платежа")
+        states[uid] = "confirm_pay"
+        await event.answer()
+        return
+    
+    # Назад
+    if data == "back":
+        states.pop(uid, None)
+        pending.pop(uid, None)
+        selected.pop(uid, None)
+        st, days = get_sub(uid)
+        await event.edit(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        await event.answer()
+        return
+
+# ============================================================================
+# СООБЩЕНИЯ
+# ============================================================================
+@bot.on(events.NewMessage)
+async def handle_msg(event):
+    uid = event.sender_id
+    state = states.get(uid)
+    
+    # Добавление аккаунта
+    if state == "phone":
+        phone = event.text.strip()
+        if len(phone) < 10:
+            await event.respond("❌ Неверный номер")
+            return
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            await client.send_code_request(phone)
+            clients[uid] = client
+            states[uid] = "code"
+            await event.respond(f"📱 Код отправлен на {phone}\nВведите код:")
+        except Exception as e:
+            await event.respond(f"❌ {str(e)[:50]}")
+            states.pop(uid, None)
+        return
+    
+    if state == "code":
+        client = clients.get(uid)
+        if not client:
+            await event.respond("❌ Ошибка")
+            states.pop(uid, None)
+            return
+        try:
+            await client.sign_in(code=event.text.strip())
+            session = client.session.save()
+            save_session(uid, session)
+            await event.respond("✅ Аккаунт добавлен!")
+            await client.disconnect()
+            clients.pop(uid, None)
+            states.pop(uid, None)
+            st, days = get_sub(uid)
+            await event.respond(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        except SessionPasswordNeededError:
+            states[uid] = "password"
+            await event.respond("🔐 Введите пароль 2FA:")
+        except PhoneCodeInvalidError:
+            await event.respond("❌ Неверный код, попробуйте еще:")
+        except Exception as e:
+            await event.respond(f"❌ {str(e)[:50]}")
+            states.pop(uid, None)
+        return
+    
+    if state == "password":
+        client = clients.get(uid)
+        if not client:
+            await event.respond("❌ Ошибка")
+            states.pop(uid, None)
+            return
+        try:
+            await client.sign_in(password=event.text.strip())
+            session = client.session.save()
+            save_session(uid, session)
+            await event.respond("✅ Аккаунт добавлен!")
+            await client.disconnect()
+            clients.pop(uid, None)
+            states.pop(uid, None)
+            st, days = get_sub(uid)
+            await event.respond(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        except Exception as e:
+            await event.respond(f"❌ {str(e)[:50]}")
+            states.pop(uid, None)
+        return
+    
+    # Рассылка
+    if state == "broadcast":
+        data = pending.get(uid)
+        if not data:
+            await event.respond("❌ Ошибка")
+            states.pop(uid, None)
+            return
+        text = event.text or ""
+        image = None
+        if event.media and event.photo:
+            try:
+                image = await event.download_media(bytes)
+            except:
+                pass
+        if not text and not image:
+            await event.respond("📝 Отправьте текст")
+            return
+        data['text'] = text
+        data['image'] = image
+        await event.respond(
+            f"📨 ПОДТВЕРЖДЕНИЕ\n\nГрупп: {len(data['groups'])}\n{trunc(text, 100)}\n\n✅ Начинаем?",
+            buttons=[
+                [Button.inline("✅ Да", b"yes")],
+                [Button.inline("❌ Нет", b"no")]
+            ]
+        )
+        states[uid] = "confirm"
+        return
+    
+    # Платеж
+    if state == "payment":
+        if event.media and event.photo:
+            await event.respond("✅ Скриншот получен!")
+            for admin in ADMINS:
+                try:
+                    await bot.send_message(admin, f"💳 Платеж от {uid}")
+                    await bot.forward_messages(admin, event.message)
+                except:
+                    pass
+            states.pop(uid, None)
+        else:
+            await event.respond("📷 Отправьте скриншот")
+        return
+    
+    # Админ рассылка
+    if state == "admin_broadcast":
+        if uid not in ADMINS:
+            await event.respond("⛔ Нет доступа")
+            states.pop(uid, None)
+            return
+        users = get_users()
+        text = event.text or ""
+        image = None
+        if event.media and event.photo:
+            try:
+                image = await event.download_media(bytes)
+            except:
+                pass
+        await event.respond(f"⏳ Отправка {len(users)} пользователям...")
+        sent = 0
+        for u in users:
+            try:
+                if image:
+                    await bot.send_file(u['id'], image, caption=text)
+                else:
+                    await bot.send_message(u['id'], text)
+                sent += 1
+                await asyncio.sleep(0.3)
+            except:
+                pass
+        await event.respond(f"✅ Готово! Отправлено: {sent}")
+        states.pop(uid, None)
+        return
+    
+    # Подтверждение платежа
+    if state == "confirm_pay":
+        if uid not in ADMINS:
+            await event.respond("⛔ Нет доступа")
+            states.pop(uid, None)
+            return
+        try:
+            pid = int(event.text.strip())
+            if confirm_pay(pid):
+                await event.respond(f"✅ Платеж #{pid} подтвержден!")
+            else:
+                await event.respond(f"❌ Платеж #{pid} не найден")
+        except:
+            await event.respond("❌ Введите ID")
+        states.pop(uid, None)
+        return
+
+# ============================================================================
+# ДОПОЛНИТЕЛЬНЫЕ КНОПКИ
+# ============================================================================
+@bot.on(events.CallbackQuery)
+async def extra(event):
+    uid = event.sender_id
+    data = event.data.decode()
+    
+    if data == "yes":
+        data = pending.get(uid)
+        if not data:
+            await event.edit("❌ Ошибка")
+            return
+        await event.edit("⏳ Отправка...")
+        ok, fail, failed = await send_groups(uid, data['groups'], data['text'], data.get('image'))
+        text = f"✅ ГОТОВО!\n\n📨 {ok} отправлено\n❌ {fail} ошибок"
+        if failed:
+            text += f"\n⚠️ {', '.join(failed[:3])}"
+        await event.edit(text)
+        pending.pop(uid, None)
+        states.pop(uid, None)
+        selected.pop(uid, None)
+        return
+    
+    if data == "no":
+        pending.pop(uid, None)
+        states.pop(uid, None)
+        selected.pop(uid, None)
+        await event.edit("❌ Отменено")
+        st, days = get_sub(uid)
+        await event.respond(f"👋 Меню\n📦 {st} | {days} дн.", buttons=menu(uid))
+        return
+
+# ============================================================================
+# ЗАПУСК
+# ============================================================================
+async def main():
+    logger.remove()
+    logger.add(sys.stdout, level="INFO")
+    
+    db_init()
+    
+    await bot.start(bot_token=BOT_TOKEN)
+    logger.info(f"🚀 @{BOT_NAME} v{VERSION}")
+    
+    for admin in ADMINS:
+        try:
+            await bot.send_message(admin, f"🚀 @{BOT_NAME} запущен!")
+        except:
+            pass
+    
+    await bot.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Остановлен")
+    except Exception as e:
+        logger.error(f"❌ {e}")
+        traceback.print_exc()
