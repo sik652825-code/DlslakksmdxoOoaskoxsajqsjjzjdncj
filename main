@@ -1,0 +1,1593 @@
+#!/usr/bin/env python3
+"""
+🤖 TELEGRAM БОТ ДЛЯ МАССОВЫХ РАССЫЛОК 🤖
+@avtorasslkabot - ВСЕ КНОПКИ РАБОТАЮТ
+Версия: 4.0.1
+"""
+
+import asyncio
+import sqlite3
+import os
+import sys
+import json
+import re
+import time
+import random
+import string
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple, Union
+from contextlib import contextmanager
+from functools import wraps
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+# ============================================================================
+# АВТОМАТИЧЕСКАЯ УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ============================================================================
+def auto_install():
+    packages = ['telethon', 'apscheduler', 'loguru', 'pillow', 'cryptg', 'python-dotenv']
+    for package in packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            print(f"📦 Установка {package}...")
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+
+auto_install()
+
+# ============================================================================
+# ИМПОРТЫ
+# ============================================================================
+from telethon import TelegramClient, Button, events
+from telethon.sessions import StringSession
+from telethon.errors import (
+    FloodWaitError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneNumberFloodError,
+    PhoneCodeExpiredError,
+    PhoneNumberInvalidError,
+    RPCError,
+    UserAlreadyParticipantError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+    SlowModeWaitError,
+    MessageTooLongError,
+    MediaInvalidError,
+    UserNotParticipantError,
+    UserBannedInChannelError,
+    PeerIdInvalidError,
+    UsernameNotOccupiedError,
+    UsernameInvalidError,
+    InviteHashInvalidError,
+    InviteHashExpiredError,
+    UserPrivacyRestrictedError,
+    ChatSendInlineForbiddenError,
+    ChatSendMediaForbiddenError,
+    MessageDeleteForbiddenError,
+    ChannelInvalidError
+)
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    InputPeerChat,
+    InputPeerChannel,
+    MessageMediaPhoto,
+    MessageMediaDocument,
+    User,
+    ChatForbidden,
+    ChannelForbidden,
+    Message,
+    PeerUser,
+    PeerChat,
+    PeerChannel
+)
+from telethon.tl.functions.messages import SendMessageRequest
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.contacts import AddContactRequest, DeleteContactsRequest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.triggers.interval import IntervalTrigger
+from loguru import logger
+from PIL import Image
+import io
+
+# ============================================================================
+# КОНФИГУРАЦИЯ
+# ============================================================================
+API_ID = 28121815
+API_HASH = "05ad718bad150a8e636724e9fed59503"
+BOT_TOKEN = "8982691390:AAFlUfA0rL-iXfnV2-jqfYQz0CaY6eEsPK8"
+BOT_USERNAME = "avtorasslkabot"
+ADMIN_IDS = [8365786708, 6668784806]
+
+# Банковские реквизиты
+CARD_NUMBER = "2202 2081 8598 3716"
+CARD_HOLDER = "MAGISTR BOT"
+BANK_NAME = "СБЕРБАНК"
+
+# Цены
+PRICE_PER_DAY = 15
+FREE_TRIAL_DAYS = 3
+VIP_DAYS = 30
+VIP_PRICE = 299
+PREMIUM_DAYS = 90
+PREMIUM_PRICE = 599
+FOREVER_PRICE = 1999
+
+VERSION = "4.0.1"
+
+# Пути к файлам
+DB_PATH = "bot_database.db"
+SPONSORS_FILE = "sponsors.json"
+REQUIRED_CHANNELS_FILE = "required_channels.json"
+SETTINGS_FILE = "settings.json"
+LOG_FILE = "bot.log"
+TEMPLATES_FILE = "templates.json"
+BLACKLIST_FILE = "blacklist.json"
+STATS_FILE = "stats.json"
+
+# Лимиты
+MAX_GROUPS_PER_USER = 2000
+MAX_MESSAGE_LENGTH = 4096
+MAX_RETRY_ATTEMPTS = 5
+RATE_LIMIT_DELAY = 2
+FLOOD_WAIT_BUFFER = 15
+MAX_SEND_GROUPS = 500
+MAX_ACCOUNTS_PER_USER = 5
+MAX_TEMPLATES_PER_USER = 30
+
+# ============================================================================
+# ПОДПИСЬ
+# ============================================================================
+SIGNATURE = f"""
+
+📢 Бесплатная рассылка 3 дня - @{BOT_USERNAME}
+🤖 Версия {VERSION}
+📱 Поддержка: @sikvvg"""
+
+# ============================================================================
+# ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
+# ============================================================================
+bot = TelegramClient("bot_session", API_ID, API_HASH, connection_retries=10)
+scheduler = AsyncIOScheduler()
+
+# ============================================================================
+# ГЛОБАЛЬНЫЕ ХРАНИЛИЩА
+# ============================================================================
+user_states: Dict[int, Dict] = {}
+phone_waiting: Dict[int, bool] = {}
+code_waiting: Dict[int, Dict] = {}
+password_waiting: Dict[int, Dict] = {}
+user_clients: Dict[int, TelegramClient] = {}
+user_phones: Dict[int, str] = {}
+selected_groups: Dict[int, List[int]] = {}
+pending_broadcast: Dict[int, Dict] = {}
+temp_data: Dict[int, Dict] = {}
+scheduled_jobs: Dict[str, Dict] = {}
+
+# ============================================================================
+# КЛАССЫ
+# ============================================================================
+@dataclass
+class UserData:
+    user_id: int
+    username: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    registered_at: str = ""
+    subscription_end: str = ""
+    subscription_type: str = "Нет"
+    has_subscription: bool = False
+    total_paid: int = 0
+    trial_used: bool = False
+    is_banned: bool = False
+    checked_channels: bool = False
+    referral_code: str = ""
+    referred_by: int = 0
+    referral_count: int = 0
+    language: str = "ru"
+    last_activity: str = ""
+    notification_enabled: bool = True
+    auto_send_enabled: bool = False
+
+@dataclass
+class GroupData:
+    id: int
+    user_id: int
+    group_id: int
+    group_username: str = ""
+    group_title: str = ""
+    group_type: str = "group"
+    added_at: str = ""
+    is_active: bool = True
+    last_sent_at: str = ""
+    send_count: int = 0
+
+# ============================================================================
+# УТИЛИТЫ
+# ============================================================================
+def format_number(num: int) -> str:
+    if num is None:
+        return "0"
+    return f"{num:,}".replace(",", " ")
+
+def generate_id(length: int = 16) -> str:
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+def get_timestamp() -> str:
+    return datetime.now().isoformat()
+
+def truncate_text(text: str, max_length: int = 200) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - 3] + "..."
+
+def safe_json_load(file_path: str, default: Any = None) -> Any:
+    if default is None:
+        default = {}
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return default
+    except Exception as e:
+        logger.error(f"Ошибка загрузки {file_path}: {e}")
+        return default
+
+def safe_json_save(file_path: str, data: Any) -> bool:
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения {file_path}: {e}")
+        return False
+
+def add_signature(text: str) -> str:
+    if not text:
+        return SIGNATURE.strip()
+    if len(text) + len(SIGNATURE) > MAX_MESSAGE_LENGTH:
+        return text[:MAX_MESSAGE_LENGTH - len(SIGNATURE) - 15] + SIGNATURE
+    return f"{text}{SIGNATURE}"
+
+def validate_phone(phone: str) -> bool:
+    phone = phone.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if not phone:
+        return False
+    if len(phone) < 10 or len(phone) > 15:
+        return False
+    if not phone.isdigit():
+        return False
+    return True
+
+def compress_image(data: bytes, max_size: int = 5 * 1024 * 1024) -> bytes:
+    try:
+        img = Image.open(io.BytesIO(data))
+        if len(data) > max_size:
+            output = io.BytesIO()
+            img.save(output, format=img.format or 'JPEG', quality=70, optimize=True)
+            compressed = output.getvalue()
+            if len(compressed) < len(data):
+                return compressed
+        return data
+    except:
+        return data
+
+@contextmanager
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def with_db_connection(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with get_db_connection() as conn:
+            return func(conn, *args, **kwargs)
+    return wrapper
+
+# ============================================================================
+# ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
+# ============================================================================
+def init_database():
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            registered_at TEXT,
+            subscription_end TEXT,
+            subscription_type TEXT DEFAULT 'Нет',
+            has_subscription INTEGER DEFAULT 0,
+            total_paid INTEGER DEFAULT 0,
+            trial_used INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            checked_channels INTEGER DEFAULT 0,
+            language_code TEXT DEFAULT 'ru',
+            last_activity TEXT,
+            referral_code TEXT,
+            referred_by INTEGER,
+            referral_count INTEGER DEFAULT 0,
+            notification_enabled INTEGER DEFAULT 1,
+            auto_send_enabled INTEGER DEFAULT 0
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            session_string TEXT,
+            created_at TEXT,
+            last_used TEXT,
+            is_active INTEGER DEFAULT 1,
+            device_name TEXT
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_id INTEGER,
+            group_username TEXT,
+            group_title TEXT,
+            group_type TEXT DEFAULT 'group',
+            added_at TEXT,
+            is_active INTEGER DEFAULT 1,
+            last_sent_at TEXT,
+            send_count INTEGER DEFAULT 0,
+            UNIQUE(user_id, group_id)
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS send_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_name TEXT,
+            group_id INTEGER,
+            sent_at TEXT,
+            message_text TEXT,
+            message_type TEXT DEFAULT 'text',
+            status TEXT DEFAULT 'sent',
+            error_message TEXT,
+            is_scheduled INTEGER DEFAULT 0
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            days INTEGER,
+            status TEXT DEFAULT 'pending',
+            payment_method TEXT DEFAULT 'card',
+            transaction_id TEXT,
+            created_at TEXT,
+            confirmed_at TEXT,
+            confirmed_by INTEGER,
+            comment TEXT
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS scheduled_sends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            groups TEXT,
+            message TEXT,
+            image_data BLOB,
+            scheduled_at TEXT,
+            interval_hours INTEGER DEFAULT 0,
+            interval_minutes INTEGER DEFAULT 0,
+            cron_expression TEXT,
+            next_run TEXT,
+            active INTEGER DEFAULT 1,
+            last_run TEXT,
+            total_runs INTEGER DEFAULT 0,
+            max_runs INTEGER DEFAULT 0,
+            created_at TEXT,
+            status TEXT DEFAULT 'active'
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            content TEXT,
+            created_at TEXT,
+            is_global INTEGER DEFAULT 0
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            created_at TEXT,
+            reward_given INTEGER DEFAULT 0,
+            reward_amount INTEGER DEFAULT 0
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            new_users INTEGER DEFAULT 0,
+            payments INTEGER DEFAULT 0,
+            revenue INTEGER DEFAULT 0,
+            sends INTEGER DEFAULT 0
+        )''')
+        
+        c.execute('CREATE INDEX IF NOT EXISTS idx_users_subscription ON users(has_subscription, subscription_end)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_groups_user ON groups(user_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_history_user ON send_history(user_id, sent_at)')
+        
+        conn.commit()
+        logger.info("✅ База данных инициализирована")
+
+# ============================================================================
+# РАБОТА С БД
+# ============================================================================
+@with_db_connection
+def register_user(conn, user_id: int, username: str, first_name: str, last_name: str = "") -> bool:
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if c.fetchone():
+        return False
+    
+    referral_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    c.execute("""INSERT INTO users 
+                (user_id, username, first_name, last_name, registered_at, has_subscription, checked_channels, referral_code, last_activity) 
+                VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)""",
+              (user_id, username or "", first_name or "", last_name or "", get_timestamp(), referral_code, get_timestamp()))
+    conn.commit()
+    logger.info(f"✅ Новый пользователь: {user_id}")
+    return True
+
+@with_db_connection
+def get_user(conn, user_id: int) -> Optional[UserData]:
+    c = conn.cursor()
+    c.execute("""SELECT user_id, username, first_name, last_name, registered_at, 
+                        subscription_end, subscription_type, has_subscription, total_paid, 
+                        trial_used, is_banned, checked_channels, referral_code, referred_by, referral_count,
+                        language_code, last_activity, notification_enabled, auto_send_enabled
+                 FROM users WHERE user_id = ?""", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    
+    return UserData(
+        user_id=row[0],
+        username=row[1] or "",
+        first_name=row[2] or "",
+        last_name=row[3] or "",
+        registered_at=row[4] or "",
+        subscription_end=row[5] or "",
+        subscription_type=row[6] or "Нет",
+        has_subscription=bool(row[7]),
+        total_paid=row[8] or 0,
+        trial_used=bool(row[9]),
+        is_banned=bool(row[10]),
+        checked_channels=bool(row[11]),
+        referral_code=row[12] or "",
+        referred_by=row[13] or 0,
+        referral_count=row[14] or 0,
+        language=row[15] or "ru",
+        last_activity=row[16] or "",
+        notification_enabled=bool(row[17]) if row[17] is not None else True,
+        auto_send_enabled=bool(row[18]) if row[18] is not None else False
+    )
+
+@with_db_connection
+def get_all_users(conn) -> List[UserData]:
+    c = conn.cursor()
+    c.execute("SELECT * FROM users ORDER BY user_id")
+    rows = c.fetchall()
+    result = []
+    for row in rows:
+        result.append(UserData(
+            user_id=row[0],
+            username=row[1] or "",
+            first_name=row[2] or "",
+            last_name=row[3] or "",
+            registered_at=row[4] or "",
+            subscription_end=row[5] or "",
+            subscription_type=row[6] or "Нет",
+            has_subscription=bool(row[7]),
+            total_paid=row[8] or 0,
+            trial_used=bool(row[9]),
+            is_banned=bool(row[10]),
+            checked_channels=bool(row[11]),
+            referral_code=row[12] or "",
+            referred_by=row[13] or 0,
+            referral_count=row[14] or 0,
+            language=row[15] or "ru",
+            last_activity=row[16] or "",
+            notification_enabled=bool(row[17]) if row[17] is not None else True,
+            auto_send_enabled=bool(row[18]) if row[18] is not None else False
+        ))
+    return result
+
+@with_db_connection
+def check_subscription(conn, user_id: int) -> bool:
+    c = conn.cursor()
+    c.execute("SELECT subscription_end, has_subscription, is_banned FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return False
+    if row[2]:
+        return False
+    if row[1] and row[0]:
+        try:
+            end = datetime.fromisoformat(row[0])
+            if datetime.now() < end:
+                return True
+        except:
+            pass
+    return False
+
+@with_db_connection
+def get_subscription_type(conn, user_id: int) -> str:
+    c = conn.cursor()
+    c.execute("SELECT subscription_type FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row and row[0] else "Нет"
+
+@with_db_connection
+def get_remaining_days(conn, user_id: int) -> int:
+    c = conn.cursor()
+    c.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if row and row[0]:
+        try:
+            end = datetime.fromisoformat(row[0])
+            return max(0, (end - datetime.now()).days)
+        except:
+            pass
+    return 0
+
+@with_db_connection
+def activate_trial(conn, user_id: int) -> bool:
+    if get_remaining_days(user_id) > 0:
+        return False
+    
+    c = conn.cursor()
+    end = datetime.now() + timedelta(days=FREE_TRIAL_DAYS)
+    c.execute("""UPDATE users 
+                 SET subscription_end = ?, has_subscription = 1, subscription_type = 'Пробная', trial_used = 1 
+                 WHERE user_id = ?""",
+              (end.isoformat(), user_id))
+    conn.commit()
+    return True
+
+@with_db_connection
+def extend_subscription(conn, user_id: int, days: int, amount: int) -> datetime:
+    c = conn.cursor()
+    c.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    
+    if row and row[0]:
+        try:
+            current = datetime.fromisoformat(row[0])
+            if datetime.now() < current:
+                new_end = current + timedelta(days=days)
+            else:
+                new_end = datetime.now() + timedelta(days=days)
+        except:
+            new_end = datetime.now() + timedelta(days=days)
+    else:
+        new_end = datetime.now() + timedelta(days=days)
+    
+    if days >= 9999:
+        sub_type = "НАВСЕГДА"
+    elif days >= 365:
+        sub_type = "VIP"
+    elif days >= 90:
+        sub_type = "PREMIUM"
+    else:
+        sub_type = "Базовая"
+    
+    c.execute("""UPDATE users 
+                 SET subscription_end = ?, has_subscription = 1, subscription_type = ?, total_paid = total_paid + ? 
+                 WHERE user_id = ?""",
+              (new_end.isoformat(), sub_type, amount, user_id))
+    conn.commit()
+    return new_end
+
+@with_db_connection
+def save_payment(conn, user_id: int, days: int, amount: int) -> int:
+    c = conn.cursor()
+    transaction_id = generate_id(12)
+    c.execute("""INSERT INTO payments (user_id, amount, days, status, transaction_id, created_at) 
+                 VALUES (?, ?, ?, 'pending', ?, ?)""",
+              (user_id, amount, days, transaction_id, get_timestamp()))
+    conn.commit()
+    return c.lastrowid
+
+@with_db_connection
+def save_session(conn, user_id: int, session_string: str) -> bool:
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO sessions (user_id, session_string, created_at, last_used, is_active) 
+                 VALUES (?, ?, ?, ?, 1)""",
+              (user_id, session_string, get_timestamp(), get_timestamp()))
+    conn.commit()
+    return True
+
+@with_db_connection
+def get_session(conn, user_id: int) -> Optional[str]:
+    c = conn.cursor()
+    c.execute("SELECT session_string FROM sessions WHERE user_id = ? AND is_active = 1", (user_id,))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE sessions SET last_used = ? WHERE user_id = ?", (get_timestamp(), user_id))
+        conn.commit()
+        return row[0]
+    return None
+
+@with_db_connection
+def add_group(conn, user_id: int, group_id: int, group_username: str = "", group_title: str = "") -> bool:
+    c = conn.cursor()
+    try:
+        c.execute("""INSERT OR IGNORE INTO groups (user_id, group_id, group_username, group_title, added_at) 
+                     VALUES (?, ?, ?, ?, ?)""",
+                  (user_id, group_id, group_username or "", group_title or str(group_id), get_timestamp()))
+        conn.commit()
+        return c.rowcount > 0
+    except:
+        return False
+
+@with_db_connection
+def add_groups_batch(conn, user_id: int, groups: List[Dict]) -> int:
+    c = conn.cursor()
+    added = 0
+    for group in groups:
+        try:
+            c.execute("""INSERT OR IGNORE INTO groups (user_id, group_id, group_username, group_title, added_at) 
+                         VALUES (?, ?, ?, ?, ?)""",
+                      (user_id, group.get('id'), group.get('username', ''), group.get('title', ''), get_timestamp()))
+            if c.rowcount > 0:
+                added += 1
+        except:
+            pass
+    conn.commit()
+    return added
+
+@with_db_connection
+def get_user_groups(conn, user_id: int) -> List[GroupData]:
+    c = conn.cursor()
+    c.execute("""SELECT id, user_id, group_id, group_username, group_title, group_type, added_at, is_active, last_sent_at, send_count
+                 FROM groups WHERE user_id = ? AND is_active = 1 ORDER BY group_title""", (user_id,))
+    rows = c.fetchall()
+    result = []
+    for row in rows:
+        result.append(GroupData(
+            id=row[0],
+            user_id=row[1],
+            group_id=row[2],
+            group_username=row[3] or "",
+            group_title=row[4] or f"Группа {row[2]}",
+            group_type=row[5] or "group",
+            added_at=row[6] or "",
+            is_active=bool(row[7]),
+            last_sent_at=row[8] or "",
+            send_count=row[9] or 0
+        ))
+    return result
+
+@with_db_connection
+def clear_user_groups(conn, user_id: int) -> bool:
+    c = conn.cursor()
+    c.execute("DELETE FROM groups WHERE user_id = ?", (user_id,))
+    conn.commit()
+    return True
+
+@with_db_connection
+def update_group_last_sent(conn, user_id: int, group_id: int):
+    c = conn.cursor()
+    c.execute("UPDATE groups SET last_sent_at = ?, send_count = send_count + 1 WHERE user_id = ? AND group_id = ?",
+              (get_timestamp(), user_id, group_id))
+    conn.commit()
+
+@with_db_connection
+def get_user_stats(conn, user_id: int) -> Dict:
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM send_history WHERE user_id = ? AND status = 'sent'", (user_id,))
+    total_sends = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM send_history WHERE user_id = ? AND status = 'error'", (user_id,))
+    error_sends = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM groups WHERE user_id = ? AND is_active = 1", (user_id,))
+    total_groups = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM payments WHERE user_id = ? AND status = 'confirmed'", (user_id,))
+    total_payments = c.fetchone()[0]
+    c.execute("SELECT SUM(amount) FROM payments WHERE user_id = ? AND status = 'confirmed'", (user_id,))
+    total_spent = c.fetchone()[0] or 0
+    return {
+        "total_sends": total_sends,
+        "error_sends": error_sends,
+        "total_groups": total_groups,
+        "total_payments": total_payments,
+        "total_spent": total_spent
+    }
+
+@with_db_connection
+def get_stats(conn) -> Dict:
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE has_subscription = 1 AND is_banned = 0")
+    active_users = c.fetchone()[0]
+    c.execute("SELECT SUM(total_paid) FROM users")
+    revenue = c.fetchone()[0] or 0
+    c.execute("SELECT COUNT(*) FROM groups WHERE is_active = 1")
+    groups = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM payments WHERE status = 'pending'")
+    pending = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+    banned = c.fetchone()[0]
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "revenue": revenue,
+        "groups": groups,
+        "pending": pending,
+        "banned": banned
+    }
+
+# ============================================================================
+# ФУНКЦИИ РАБОТЫ С ТЕЛЕГРАМ
+# ============================================================================
+async def get_user_client(user_id: int) -> Optional[TelegramClient]:
+    if user_id in user_clients:
+        client = user_clients[user_id]
+        if client.is_connected():
+            return client
+    
+    session = get_session(user_id)
+    if not session:
+        return None
+    
+    try:
+        client = TelegramClient(StringSession(session), API_ID, API_HASH, connection_retries=3)
+        await client.connect()
+        if await client.is_user_authorized():
+            user_clients[user_id] = client
+            return client
+        else:
+            await client.disconnect()
+            return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения клиента: {e}")
+        return None
+
+async def get_user_groups_from_telegram(user_id: int) -> List[Dict]:
+    client = await get_user_client(user_id)
+    if not client:
+        return []
+    
+    try:
+        dialogs = await client.get_dialogs()
+        groups = []
+        for dialog in dialogs:
+            if dialog.is_group or dialog.is_channel:
+                entity = dialog.entity
+                groups.append({
+                    'id': entity.id,
+                    'title': dialog.name or str(entity.id),
+                    'username': entity.username if hasattr(entity, 'username') else ''
+                })
+        return groups
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения групп: {e}")
+        return []
+
+async def send_message_to_groups(user_id: int, groups: List[Dict], text: str, image_data: Optional[bytes] = None) -> Dict:
+    if not check_subscription(user_id):
+        return {"success": 0, "fails": 0, "failed_groups": ["Подписка истекла"]}
+    
+    client = await get_user_client(user_id)
+    if not client:
+        return {"success": 0, "fails": 0, "failed_groups": ["Нет аккаунта"]}
+    
+    final_text = add_signature(text)
+    success = 0
+    fails = 0
+    failed_groups = []
+    
+    try:
+        me = await client.get_me()
+        
+        for idx, group in enumerate(groups[:MAX_SEND_GROUPS]):
+            try:
+                group_id = int(group['id'])
+                group_title = group.get('title') or str(group_id)
+                
+                if idx > 0:
+                    await asyncio.sleep(RATE_LIMIT_DELAY)
+                
+                try:
+                    entity = await client.get_entity(group_id)
+                except:
+                    dialogs = await client.get_dialogs()
+                    entity = None
+                    for dialog in dialogs:
+                        if dialog.entity.id == group_id:
+                            entity = dialog.entity
+                            break
+                
+                if not entity:
+                    raise Exception("Entity не найдено")
+                
+                try:
+                    if image_data:
+                        await client.send_file(entity, compress_image(image_data), caption=final_text)
+                    else:
+                        await client.send_message(entity, final_text)
+                    
+                    success += 1
+                    update_group_last_sent(user_id, group_id)
+                    logger.info(f"✅ Отправлено в {group_title}")
+                    
+                except FloodWaitError as e:
+                    wait_time = e.seconds + FLOOD_WAIT_BUFFER
+                    logger.warning(f"⏳ Flood wait {wait_time} сек")
+                    await asyncio.sleep(wait_time)
+                    fails += 1
+                    failed_groups.append(group_title)
+                    
+                except Exception as e:
+                    fails += 1
+                    failed_groups.append(group_title)
+                    logger.error(f"❌ Ошибка в {group_title}: {e}")
+                    
+            except Exception as e:
+                fails += 1
+                failed_groups.append(str(group_id))
+                logger.error(f"❌ Ошибка обработки группы: {e}")
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        return {"success": 0, "fails": 1, "failed_groups": [str(e)[:100]]}
+    
+    return {"success": success, "fails": fails, "failed_groups": failed_groups}
+
+# ============================================================================
+# МЕНЮ
+# ============================================================================
+def get_main_menu(user_id: int) -> List[List]:
+    is_admin = user_id in ADMIN_IDS
+    buttons = [
+        [Button.inline("➕ Добавить аккаунт", b"add_account")],
+        [Button.inline("📋 Импорт групп", b"import_groups")],
+        [Button.inline("👥 Мои группы", b"my_groups")],
+        [Button.inline("📨 Рассылка", b"send_message")],
+        [Button.inline("📊 История", b"show_history")],
+        [Button.inline("🛍️ Подписка", b"buy_subscription")],
+        [Button.inline("ℹ️ Инфо", b"info")]
+    ]
+    if is_admin:
+        buttons.append([Button.inline("👑 Админ панель", b"admin_panel")])
+    return buttons
+
+def get_admin_menu() -> List[List]:
+    return [
+        [Button.inline("📊 Статистика", b"admin_stats")],
+        [Button.inline("👥 Пользователи", b"admin_users")],
+        [Button.inline("💳 Платежи", b"admin_payments")],
+        [Button.inline("📢 Объявления", b"admin_broadcast")],
+        [Button.inline("◀️ Назад", b"back_to_main")]
+    ]
+
+def get_subscription_menu() -> List[List]:
+    return [
+        [Button.inline("🎁 Пробная (3 дня)", b"trial_subscription")],
+        [Button.inline("📦 Базовая (30 дней) - 450 руб", b"buy_30")],
+        [Button.inline("⭐ PREMIUM (90 дней) - 599 руб", b"buy_90")],
+        [Button.inline("💎 VIP (365 дней) - 1499 руб", b"buy_365")],
+        [Button.inline("👑 НАВСЕГДА - 1999 руб", b"buy_forever")],
+        [Button.inline("◀️ Назад", b"back_to_main")]
+    ]
+
+# ============================================================================
+# ПОКАЗ ВЫБОРА ГРУПП
+# ============================================================================
+async def show_group_selection(user_id: int, page: int = 0, filter_text: str = ""):
+    groups = get_user_groups(user_id)
+    
+    if not groups:
+        await bot.send_message(user_id, 
+            "❌ У вас нет добавленных групп.\n\n"
+            "Импортируйте группы через кнопку '📋 Импорт групп'",
+            buttons=[
+                [Button.inline("📋 Импорт групп", b"import_groups")],
+                [Button.inline("◀️ Назад", b"back_to_main")]
+            ]
+        )
+        return
+    
+    if filter_text:
+        groups = [g for g in groups if filter_text.lower() in g.group_title.lower()]
+    
+    per_page = 10
+    total_pages = (len(groups) + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, len(groups))
+    page_groups = groups[start:end]
+    
+    selected = selected_groups.get(user_id, [])
+    
+    text = f"📋 ВЫБОР ГРУПП\n\n"
+    text += f"Всего: {len(groups)}\n"
+    text += f"Выбрано: {len(selected)}\n"
+    text += f"Страница {page + 1} из {max(1, total_pages)}\n\n"
+    
+    buttons = []
+    
+    if len(selected) == len(groups) and groups:
+        buttons.append([Button.inline(f"✅ Выбраны все ({len(groups)})", b"clear_all")])
+    else:
+        buttons.append([Button.inline(f"☑️ Выбрать все", b"select_all")])
+    
+    for group in page_groups:
+        group_id = str(group.group_id)
+        is_selected = group_id in selected
+        status = "✅" if is_selected else "⬜"
+        title = group.group_title[:25] + "..." if len(group.group_title) > 25 else group.group_title
+        buttons.append([Button.inline(f"{status} {title}", f"toggle_{group_id}".encode())])
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(Button.inline("◀️", f"page_{page - 1}".encode()))
+    if page < total_pages - 1:
+        nav_buttons.append(Button.inline("▶️", f"page_{page + 1}".encode()))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([Button.inline("🔍 Поиск", b"search_groups")])
+    
+    if selected:
+        buttons.append([Button.inline("📨 Отправить выбранные", b"send_selected")])
+        buttons.append([Button.inline("🗑️ Очистить выбор", b"clear_all")])
+    else:
+        buttons.append([Button.inline("📨 Отправить во все", b"send_all")])
+    
+    buttons.append([Button.inline("◀️ Назад", b"back_to_main")])
+    
+    await bot.send_message(user_id, text, buttons=buttons)
+
+# ============================================================================
+# ОБРАБОТЧИКИ КНОПОК
+# ============================================================================
+@bot.on(events.CallbackQuery)
+async def handle_callback(event):
+    uid = event.sender_id
+    data = event.data.decode()
+    
+    # Навигация по группам
+    if data.startswith("page_"):
+        page = int(data.split("_")[1])
+        await show_group_selection(uid, page)
+        await event.answer()
+        return
+    
+    if data.startswith("toggle_"):
+        group_id = data.split("_")[1]
+        selected = selected_groups.get(uid, [])
+        if group_id in selected:
+            selected.remove(group_id)
+        else:
+            selected.append(group_id)
+        selected_groups[uid] = selected
+        await show_group_selection(uid)
+        await event.answer()
+        return
+    
+    if data == "select_all":
+        groups = get_user_groups(uid)
+        selected_groups[uid] = [str(g.group_id) for g in groups]
+        await show_group_selection(uid)
+        await event.answer("✅ Все группы выбраны")
+        return
+    
+    if data == "clear_all":
+        selected_groups[uid] = []
+        await show_group_selection(uid)
+        await event.answer("🗑️ Выбор очищен")
+        return
+    
+    if data == "search_groups":
+        await bot.send_message(uid, "🔍 Введите текст для поиска групп:", 
+            buttons=[[Button.inline("◀️ Назад", b"back_to_groups")]])
+        user_states[uid] = {"state": "search_groups"}
+        await event.answer()
+        return
+    
+    if data == "back_to_groups":
+        await show_group_selection(uid)
+        await event.answer()
+        return
+    
+    # Рассылка
+    if data == "send_message":
+        await show_group_selection(uid)
+        await event.answer()
+        return
+    
+    if data == "send_selected":
+        selected = selected_groups.get(uid, [])
+        if not selected:
+            await event.answer("❌ Не выбрано ни одной группы", alert=True)
+            return
+        
+        groups = get_user_groups(uid)
+        selected_groups_data = [{"id": g.group_id, "title": g.group_title} for g in groups if str(g.group_id) in selected]
+        pending_broadcast[uid] = {"groups": selected_groups_data}
+        
+        await bot.send_message(uid,
+            f"📨 ВЫБРАНО ГРУПП: {len(selected)}\n\n"
+            "Отправьте текст сообщения.\n"
+            "Можно прикрепить изображение.",
+            buttons=[[Button.inline("◀️ Назад", b"back_to_groups")]]
+        )
+        user_states[uid] = {"state": "broadcast_message"}
+        await event.answer()
+        return
+    
+    if data == "send_all":
+        groups = get_user_groups(uid)
+        if not groups:
+            await event.answer("❌ Нет групп", alert=True)
+            return
+        
+        pending_broadcast[uid] = {"groups": [{"id": g.group_id, "title": g.group_title} for g in groups]}
+        
+        await bot.send_message(uid,
+            f"📨 ВСЕ ГРУППЫ: {len(groups)}\n\n"
+            "Отправьте текст сообщения.\n"
+            "Можно прикрепить изображение.",
+            buttons=[[Button.inline("◀️ Назад", b"back_to_groups")]]
+        )
+        user_states[uid] = {"state": "broadcast_message"}
+        await event.answer()
+        return
+    
+    if data == "confirm_broadcast":
+        broadcast_data = pending_broadcast.get(uid)
+        if not broadcast_data:
+            await event.edit("❌ Данные рассылки потеряны")
+            return
+        
+        groups = broadcast_data.get('groups', [])
+        message = broadcast_data.get('message', '')
+        image_data = broadcast_data.get('image_data')
+        
+        if not groups or not message:
+            await event.edit("❌ Недостаточно данных")
+            return
+        
+        await event.edit("⏳ Запуск рассылки...")
+        result = await send_message_to_groups(uid, groups, message, image_data)
+        
+        text = f"✅ РАССЫЛКА ЗАВЕРШЕНА\n\n📨 Отправлено: {result['success']}\n❌ Ошибок: {result['fails']}"
+        if result['failed_groups']:
+            text += f"\n⚠️ Ошибки: {', '.join(result['failed_groups'][:5])}"
+        
+        await event.edit(text)
+        pending_broadcast.pop(uid, None)
+        user_states.pop(uid, None)
+        selected_groups.pop(uid, None)
+        return
+    
+    if data == "cancel_broadcast":
+        pending_broadcast.pop(uid, None)
+        user_states.pop(uid, None)
+        await event.edit("❌ Рассылка отменена")
+        await event.respond("👋 Главное меню", buttons=get_main_menu(uid))
+        return
+    
+    # Импорт групп
+    if data == "import_groups":
+        await bot.send_message(uid,
+            "📋 ИМПОРТ ГРУПП\n\n"
+            "Выберите способ:",
+            buttons=[
+                [Button.inline("📋 Все группы из аккаунта", b"import_all")],
+                [Button.inline("◀️ Назад", b"back_to_main")]
+            ]
+        )
+        await event.answer()
+        return
+    
+    if data == "import_all":
+        await event.edit("⏳ Загрузка групп...")
+        groups = await get_user_groups_from_telegram(uid)
+        
+        if not groups:
+            await event.edit("❌ Не найдено ни одной группы")
+            return
+        
+        added = add_groups_batch(uid, groups)
+        await event.edit(f"✅ Добавлено {added} групп из {len(groups)}")
+        await asyncio.sleep(1)
+        await event.respond("👋 Главное меню", buttons=get_main_menu(uid))
+        return
+    
+    # Группы
+    if data == "my_groups":
+        groups = get_user_groups(uid)
+        if not groups:
+            await event.edit("❌ У вас нет групп", buttons=[[Button.inline("◀️ Назад", b"back_to_main")]])
+            return
+        
+        text = f"👥 МОИ ГРУППЫ ({len(groups)})\n\n"
+        for g in groups[:20]:
+            text += f"📌 {g.group_title[:30]} - {g.send_count} отправок\n"
+        
+        if len(groups) > 20:
+            text += f"\n... и еще {len(groups) - 20} групп"
+        
+        buttons = [
+            [Button.inline("🗑️ Очистить группы", b"clear_groups")],
+            [Button.inline("◀️ Назад", b"back_to_main")]
+        ]
+        await event.edit(text, buttons=buttons)
+        return
+    
+    if data == "clear_groups":
+        clear_user_groups(uid)
+        await event.edit("✅ Все группы удалены", buttons=[[Button.inline("◀️ Назад", b"back_to_main")]])
+        return
+    
+    # Подписка
+    if data == "buy_subscription":
+        days = get_remaining_days(uid)
+        sub_type = get_subscription_type(uid)
+        
+        text = f"🛍️ ПОДПИСКА\n\n📦 Текущая: {sub_type}\n📅 Осталось: {days} дн.\n\n"
+        text += "💰 ЦЕНЫ:\n🎁 Пробная - БЕСПЛАТНО (3 дня)\n"
+        text += "📦 Базовая - 450 руб (30 дней)\n"
+        text += "⭐ PREMIUM - 599 руб (90 дней)\n"
+        text += "💎 VIP - 1499 руб (365 дней)\n"
+        text += "👑 НАВСЕГДА - 1999 руб\n\n"
+        text += f"💳 Карта: {CARD_NUMBER}\nПолучатель: {CARD_HOLDER}"
+        
+        await event.edit(text, buttons=get_subscription_menu())
+        return
+    
+    if data == "trial_subscription":
+        if activate_trial(uid):
+            await event.edit("✅ Пробная подписка активирована на 3 дня!")
+        else:
+            await event.edit("❌ Пробная подписка уже использована")
+        await asyncio.sleep(1)
+        await event.respond("👋 Главное меню", buttons=get_main_menu(uid))
+        return
+    
+    if data.startswith("buy_"):
+        days_map = {"buy_30": 30, "buy_90": 90, "buy_365": 365, "buy_forever": 9999}
+        price_map = {"buy_30": 450, "buy_90": 599, "buy_365": 1499, "buy_forever": 1999}
+        
+        days = days_map.get(data, 0)
+        price = price_map.get(data, 0)
+        
+        if not days or not price:
+            await event.edit("❌ Неверный выбор")
+            return
+        
+        payment_id = save_payment(uid, days, price)
+        
+        text = f"💳 ОПЛАТА\n\n📅 Дней: {days}\n💰 Сумма: {price} руб\n🆔 Платеж: #{payment_id}\n\n"
+        text += f"💳 Реквизиты:\nКарта: {CARD_NUMBER}\nПолучатель: {CARD_HOLDER}\n"
+        text += f"💬 Комментарий: {payment_id}\n\n📝 После оплаты отправьте скриншот"
+        
+        await event.edit(text, buttons=[
+            [Button.inline("✅ Я оплатил", b"payment_confirmed")],
+            [Button.inline("◀️ Назад", b"buy_subscription")]
+        ])
+        return
+    
+    if data == "payment_confirmed":
+        await bot.send_message(uid,
+            "📝 Отправьте скриншот платежа.\nАдминистратор подтвердит оплату.",
+            buttons=[[Button.inline("◀️ Назад", b"buy_subscription")]]
+        )
+        user_states[uid] = {"state": "payment_confirm"}
+        await event.answer()
+        return
+    
+    # История
+    if data == "show_history":
+        history = get_user_stats(uid)
+        text = f"📊 ИСТОРИЯ\n\n"
+        text += f"📨 Отправок: {history['total_sends']}\n"
+        text += f"❌ Ошибок: {history['error_sends']}\n"
+        text += f"👥 Групп: {history['total_groups']}\n"
+        text += f"💳 Платежей: {history['total_payments']}\n"
+        text += f"💰 Потрачено: {history['total_spent']} руб"
+        
+        await event.edit(text, buttons=[[Button.inline("◀️ Назад", b"back_to_main")]])
+        return
+    
+    # Аккаунты
+    if data == "add_account":
+        await bot.send_message(uid,
+            "📱 Введите номер телефона:\n+7XXXXXXXXXX",
+            buttons=[[Button.inline("◀️ Назад", b"back_to_main")]]
+        )
+        user_states[uid] = {"state": "add_account_phone"}
+        await event.answer()
+        return
+    
+    # Инфо
+    if data == "info":
+        days = get_remaining_days(uid)
+        sub_type = get_subscription_type(uid)
+        stats = get_user_stats(uid)
+        
+        text = f"ℹ️ ИНФОРМАЦИЯ\n\n"
+        text += f"🤖 Бот: @{BOT_USERNAME}\n"
+        text += f"📌 Версия: {VERSION}\n"
+        text += f"📦 Подписка: {sub_type}\n"
+        text += f"📅 Осталось: {days} дн.\n\n"
+        text += f"📊 Статистика:\n"
+        text += f"├ 📨 Отправок: {stats['total_sends']}\n"
+        text += f"├ 👥 Групп: {stats['total_groups']}\n"
+        text += f"├ 💳 Платежей: {stats['total_payments']}\n"
+        text += f"└ 💰 Потрачено: {stats['total_spent']} руб\n\n"
+        text += f"📱 Поддержка: @sikvvg"
+        
+        await event.edit(text, buttons=[[Button.inline("◀️ Назад", b"back_to_main")]])
+        return
+    
+    # Админ панель
+    if data == "admin_panel":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Доступ запрещен", alert=True)
+            return
+        
+        stats = get_stats()
+        text = f"👑 АДМИН ПАНЕЛЬ\n\n"
+        text += f"👥 Всего: {stats['total_users']}\n"
+        text += f"🟢 Активных: {stats['active_users']}\n"
+        text += f"💰 Выручка: {stats['revenue']} руб\n"
+        text += f"👥 Групп: {stats['groups']}\n"
+        text += f"💳 Ожидают: {stats['pending']}\n"
+        text += f"⛔ Заблокировано: {stats['banned']}"
+        
+        await event.edit(text, buttons=get_admin_menu())
+        return
+    
+    if data == "admin_stats":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Доступ запрещен", alert=True)
+            return
+        stats = get_stats()
+        text = f"📊 СТАТИСТИКА\n\n"
+        text += f"👥 Всего: {stats['total_users']}\n"
+        text += f"🟢 Активных: {stats['active_users']}\n"
+        text += f"💰 Выручка: {stats['revenue']} руб\n"
+        text += f"👥 Групп: {stats['groups']}\n"
+        text += f"💳 Ожидают: {stats['pending']}\n"
+        text += f"⛔ Заблокировано: {stats['banned']}"
+        await event.edit(text, buttons=get_admin_menu())
+        return
+    
+    if data == "admin_users":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Доступ запрещен", alert=True)
+            return
+        users = get_all_users()
+        text = f"👥 ПОЛЬЗОВАТЕЛИ ({len(users)})\n\n"
+        for u in users[:20]:
+            status = "🟢" if u.has_subscription else "🔴"
+            if u.is_banned:
+                status = "⛔"
+            text += f"{status} `{u.user_id}` | @{u.username} | {u.subscription_type}\n"
+        if len(users) > 20:
+            text += f"\n... и еще {len(users) - 20}"
+        await event.edit(text, buttons=get_admin_menu())
+        return
+    
+    if data == "admin_payments":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Доступ запрещен", alert=True)
+            return
+        await event.edit("💳 Ожидающие платежи", buttons=get_admin_menu())
+        return
+    
+    if data == "admin_broadcast":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Доступ запрещен", alert=True)
+            return
+        await bot.send_message(uid, 
+            "📢 АДМИН РАССЫЛКА\n\nОтправьте сообщение для всех пользователей.",
+            buttons=[[Button.inline("◀️ Назад", b"admin_panel")]]
+        )
+        user_states[uid] = {"state": "admin_broadcast"}
+        await event.answer()
+        return
+    
+    # Назад
+    if data == "back_to_main":
+        user_states.pop(uid, None)
+        pending_broadcast.pop(uid, None)
+        selected_groups.pop(uid, None)
+        temp_data.pop(uid, None)
+        days = get_remaining_days(uid)
+        sub_type = get_subscription_type(uid)
+        await event.edit(
+            f"👋 Главное меню\n📦 Подписка: {sub_type}\n📅 Осталось: {days} дн.",
+            buttons=get_main_menu(uid)
+        )
+        await event.answer()
+        return
+
+# ============================================================================
+# ОБРАБОТЧИКИ СООБЩЕНИЙ
+# ============================================================================
+@bot.on(events.NewMessage)
+async def handle_messages(event):
+    uid = event.sender_id
+    if not event.text and not event.media:
+        return
+    
+    text = event.text or ""
+    state = user_states.get(uid, {}).get("state")
+    
+    # Поиск групп
+    if state == "search_groups":
+        filter_text = text.strip()
+        await show_group_selection(uid, 0, filter_text)
+        user_states.pop(uid, None)
+        return
+    
+    # Сообщение для рассылки
+    if state == "broadcast_message":
+        broadcast_data = pending_broadcast.get(uid)
+        if not broadcast_data:
+            await event.respond("❌ Данные потеряны")
+            user_states.pop(uid, None)
+            return
+        
+        message_text = text
+        image_data = None
+        
+        if event.media and event.photo:
+            try:
+                image_data = await event.download_media(bytes)
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки фото: {e}")
+                await event.respond("⚠️ Не удалось загрузить изображение")
+                return
+        
+        if not message_text and not image_data:
+            await event.respond("📝 Отправьте текст или текст с изображением")
+            return
+        
+        broadcast_data['message'] = message_text
+        broadcast_data['image_data'] = image_data
+        
+        groups_count = len(broadcast_data['groups'])
+        has_image = "📷 с изображением" if image_data else "📝 текстовое"
+        preview = message_text[:200] + "..." if len(message_text) > 200 else message_text
+        
+        await event.respond(
+            f"📨 ПОДТВЕРДИТЕ РАССЫЛКУ\n\nГрупп: {groups_count}\nТип: {has_image}\n\n{preview}\n\n✅ Начинаем?",
+            buttons=[
+                [Button.inline("✅ Начать", b"confirm_broadcast")],
+                [Button.inline("❌ Отмена", b"cancel_broadcast")]
+            ]
+        )
+        user_states[uid] = {"state": "broadcast_confirm"}
+        return
+    
+    # Добавление аккаунта
+    if state == "add_account_phone":
+        phone = text.strip()
+        if not validate_phone(phone):
+            await event.respond("❌ Неверный формат. Используйте +7XXXXXXXXXX")
+            return
+        
+        user_phones[uid] = phone
+        
+        try:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            await client.send_code_request(phone)
+            user_clients[uid] = client
+            user_states[uid] = {"state": "add_account_code"}
+            await event.respond(f"📱 Код отправлен на {phone}\n\nВведите код из Telegram:")
+        except Exception as e:
+            await event.respond(f"❌ Ошибка: {str(e)[:100]}")
+            user_states.pop(uid, None)
+        return
+    
+    if state == "add_account_code":
+        client = user_clients.get(uid)
+        if not client:
+            await event.respond("❌ Сессия истекла")
+            user_states.pop(uid, None)
+            return
+        
+        phone = user_phones.get(uid, "")
+        code = text.strip()
+        
+        try:
+            await client.sign_in(phone, code)
+            session_string = client.session.save()
+            save_session(uid, session_string)
+            
+            await event.respond(f"✅ Аккаунт {phone} успешно добавлен!")
+            logger.info(f"✅ Аккаунт добавлен: {phone}")
+            
+            await client.disconnect()
+            user_clients.pop(uid, None)
+            user_states.pop(uid, None)
+            user_phones.pop(uid, None)
+            
+            await event.respond("👋 Главное меню", buttons=get_main_menu(uid))
+            
+        except SessionPasswordNeededError:
+            user_states[uid] = {"state": "add_account_password"}
+            await event.respond("🔐 Введите пароль 2FA:")
+        except PhoneCodeInvalidError:
+            await event.respond("❌ Неверный код. Попробуйте еще раз:")
+        except Exception as e:
+            await event.respond(f"❌ Ошибка: {str(e)[:100]}")
+            user_states.pop(uid, None)
+        return
+    
+    if state == "add_account_password":
+        client = user_clients.get(uid)
+        if not client:
+            await event.respond("❌ Сессия истекла")
+            user_states.pop(uid, None)
+            return
+        
+        password = text.strip()
+        phone = user_phones.get(uid, "")
+        
+        try:
+            await client.sign_in(password=password)
+            session_string = client.session.save()
+            save_session(uid, session_string)
+            
+            await event.respond(f"✅ Аккаунт {phone} успешно добавлен!")
+            logger.info(f"✅ Аккаунт добавлен: {phone}")
+            
+            await client.disconnect()
+            user_clients.pop(uid, None)
+            user_states.pop(uid, None)
+            user_phones.pop(uid, None)
+            
+            await event.respond("👋 Главное меню", buttons=get_main_menu(uid))
+            
+        except Exception as e:
+            await event.respond(f"❌ Ошибка: {str(e)[:100]}")
+            user_states.pop(uid, None)
+        return
+    
+    # Подтверждение платежа
+    if state == "payment_confirm":
+        if event.media and event.photo:
+            await event.respond("✅ Скриншот получен! Ожидайте подтверждения.")
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, f"💳 НОВЫЙ ПЛАТЕЖ\n👤 Пользователь: {uid}")
+                    await bot.forward_messages(admin_id, event.message)
+                except:
+                    pass
+            
+            user_states.pop(uid, None)
+        else:
+            await event.respond("📷 Отправьте скриншот платежа")
+        return
+    
+    # Админ рассылка
+    if state == "admin_broadcast":
+        if uid not in ADMIN_IDS:
+            await event.respond("❌ Доступ запрещен")
+            user_states.pop(uid, None)
+            return
+        
+        message_text = text
+        image_data = None
+        
+        if event.media and event.photo:
+            try:
+                image_data = await event.download_media(bytes)
+            except:
+                pass
+        
+        if not message_text:
+            await event.respond("📝 Отправьте текст")
+            return
+        
+        users = get_all_users()
+        await event.respond(f"⏳ Отправка админ рассылки {len(users)} пользователям...")
+        
+        sent = 0
+        for user in users:
+            try:
+                if image_data:
+                    await bot.send_file(user.user_id, image_data, caption=message_text)
+                else:
+                    await bot.send_message(user.user_id, message_text)
+                sent += 1
+                await asyncio.sleep(0.5)
+            except:
+                pass
+        
+        await event.respond(f"✅ Админ рассылка завершена!\n📨 Отправлено: {sent}")
+        user_states.pop(uid, None)
+        return
+    
+    # Команды
+    if text.startswith("/start"):
+        user = await event.get_sender()
+        is_new = register_user(uid, user.username, user.first_name, user.last_name or "")
+        
+        days = get_remaining_days(uid)
+        sub_type = get_subscription_type(uid)
+        
+        welcome = f"👋 Добро пожаловать в бот @{BOT_USERNAME}!\n\n"
+        welcome += f"🤖 Бот для массовых рассылок в Telegram.\n"
+        welcome += f"📦 Подписка: {sub_type}\n"
+        welcome += f"📅 Осталось: {days} дн.\n\n"
+        welcome += f"🚀 Для начала:\n1️⃣ Добавьте аккаунт\n2️⃣ Импортируйте группы\n3️⃣ Начните рассылку"
+        
+        await event.respond(welcome, buttons=get_main_menu(uid))
+        return
+    
+    if text.startswith("/help"):
+        help_text = f"🤖 ПОМОЩЬ @{BOT_USERNAME}\n\n"
+        help_text += "/start - Главное меню\n"
+        help_text += "/help - Справка\n\n"
+        help_text += "📱 Поддержка: @sikvvg"
+        await event.respond(help_text)
+        return
+    
+    # Если не в состоянии - показываем меню
+    if uid not in user_states:
+        days = get_remaining_days(uid)
+        sub_type = get_subscription_type(uid)
+        await event.respond(
+            f"👋 Главное меню\n📦 Подписка: {sub_type}\n📅 Осталось: {days} дн.",
+            buttons=get_main_menu(uid)
+        )
+
+# ============================================================================
+# ЗАПУСК БОТА
+# ============================================================================
+async def main():
+    logger.remove()
+    logger.add(sys.stdout, level="INFO")
+    logger.add(LOG_FILE, rotation="1 day", retention="7 days", level="DEBUG")
+    
+    init_database()
+    
+    await bot.start(bot_token=BOT_TOKEN)
+    logger.info(f"🚀 Бот @{BOT_USERNAME} запущен! Версия {VERSION}")
+    
+    scheduler.start()
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, 
+                f"🚀 Бот @{BOT_USERNAME} запущен!\n📌 Версия: {VERSION}")
+        except:
+            pass
+    
+    await bot.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
+        traceback.print_exc()
